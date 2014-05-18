@@ -51,9 +51,9 @@ bool fReindex = false;
 bool fBenchmark = false;
 bool fTxIndex = false;
 unsigned int nCoinCacheSize = 5000;
-const int64 nChainStartTimeNAdaptive = 1374380318; // Line: 2815
-const int64 nHardforkStartTime = 1400724000;  // second hardfork: to scrypt-N
-const int64 nDiffChangeTarget = 95000; // first hardfork: diff change to Digishield on block 93500
+const int64 nChainStartTimeNAdaptive = 1389306217; // hardfork: switch to Scrypt-N
+const int64 nHardforkStartTime = 1400724000; // hardfork: switch to Scrypt-N
+const int64 nDiffChangeTarget = 95000; // hardfork: switch to KGW
 
 /** Fees smaller than this (in satoshi) are considered zero fee (for transaction creation) */
 int64 CTransaction::nMinTxFee = 10000000;
@@ -1165,8 +1165,8 @@ int64 static GetBlockValue(int nHeight, int64 nFees, uint256 prevHash)
     return nSubsidy + nFees;
 }
 
-static const int64 nTargetTimespan = 3 * 60; // 3 mins
-static const int64 nTargetTimespanNEW = 70; // Spots: every block (70 seconds) (digishield)
+static const int64 nTargetTimespan = 3 * 60; // 3 minutes
+static const int64 nTargetTimespanNEW = 70; // Spots: every 2 blocks (140 seconds)
 static const int64 nTargetSpacing = 70; // Spots2: 70 seconds
 static const int64 nInterval = nTargetTimespan / nTargetSpacing;
 
@@ -1314,32 +1314,36 @@ unsigned int static KimotoGravityWell(const CBlockIndex* pindexLast, const CBloc
         
     if (BlockLastSolved == NULL || BlockLastSolved->nHeight == 0 || (uint64)BlockLastSolved->nHeight < PastBlocksMin) { return bnProofOfWorkLimit.GetCompact(); }
         
+	int64 LatestBlockTime = BlockLastSolved->GetBlockTime();
         for (unsigned int i = 1; BlockReading && BlockReading->nHeight > 0; i++) {
                 if (PastBlocksMax > 0 && i > PastBlocksMax) { break; }
                 PastBlocksMass++;
-                
+
                 if (i == 1) { PastDifficultyAverage.SetCompact(BlockReading->nBits); }
                 else { PastDifficultyAverage = ((CBigNum().SetCompact(BlockReading->nBits) - PastDifficultyAveragePrev) / i) + PastDifficultyAveragePrev; }
                 PastDifficultyAveragePrev = PastDifficultyAverage;
-                
-                PastRateActualSeconds = BlockLastSolved->GetBlockTime() - BlockReading->GetBlockTime();
+
+		if (LatestBlockTime < BlockReading->GetBlockTime()) {
+                    LatestBlockTime = BlockReading->GetBlockTime();
+		}
+                PastRateActualSeconds = LatestBlockTime - BlockReading->GetBlockTime();
                 PastRateTargetSeconds = TargetBlocksSpacingSeconds * PastBlocksMass;
                 PastRateAdjustmentRatio = double(1);
-                if (PastRateActualSeconds < 0) { PastRateActualSeconds = 0; }
+		if (PastRateActualSeconds < 1) { PastRateActualSeconds = 1; }
                 if (PastRateActualSeconds != 0 && PastRateTargetSeconds != 0) {
-                PastRateAdjustmentRatio = double(PastRateTargetSeconds) / double(PastRateActualSeconds);
+                    PastRateAdjustmentRatio = double(PastRateTargetSeconds) / double(PastRateActualSeconds);
                 }
                 EventHorizonDeviation = 1 + (0.7084 * pow((double(PastBlocksMass)/double(28.2)), -1.228));
                 EventHorizonDeviationFast = EventHorizonDeviation;
                 EventHorizonDeviationSlow = 1 / EventHorizonDeviation;
-                
+
                 if (PastBlocksMass >= PastBlocksMin) {
                         if ((PastRateAdjustmentRatio <= EventHorizonDeviationSlow) || (PastRateAdjustmentRatio >= EventHorizonDeviationFast)) { assert(BlockReading); break; }
                 }
                 if (BlockReading->pprev == NULL) { assert(BlockReading); break; }
                 BlockReading = BlockReading->pprev;
         }
-        
+
         CBigNum bnNew(PastDifficultyAverage);
         if (PastRateActualSeconds != 0 && PastRateTargetSeconds != 0) {
                 bnNew *= PastRateActualSeconds;
@@ -1352,14 +1356,19 @@ unsigned int static KimotoGravityWell(const CBlockIndex* pindexLast, const CBloc
 
 unsigned int static GetNextWorkRequired_V2(const CBlockIndex* pindexLast, const CBlockHeader *pblock)
 {
-        static const int64 BlocksTargetSpacing = 2 * 60; // 2 minutes for Spots2
+        static const int64 BlocksTargetSpacing = 70; // 70 seconds
         static const unsigned int TimeDaySeconds = 60 * 60 * 24;
         int64 PastSecondsMin = TimeDaySeconds * 0.01; // 0.25 in megacoin, 0.01 in some others
         int64 PastSecondsMax = TimeDaySeconds * 0.14; // 7 days in megacoin, 0.14 in some others
         uint64 PastBlocksMin = PastSecondsMin / BlocksTargetSpacing;
         uint64 PastBlocksMax = PastSecondsMax / BlocksTargetSpacing;
-        
-        return KimotoGravityWell(pindexLast, pblock, BlocksTargetSpacing, PastBlocksMin, PastBlocksMax);
+
+        unsigned int diff = KimotoGravityWell(pindexLast, pblock, BlocksTargetSpacing, PastBlocksMin, PastBlocksMax);
+        /// debug print
+        printf("GetNextWorkRequired RETARGET-KGW\n");
+        printf("Before: %08x\n", pindexLast->nBits);
+        printf("After:  %08x\n", diff);
+	return diff;
 }
 
 unsigned int static GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader *pblock)
@@ -3437,7 +3446,21 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         CAddress addrFrom;
         uint64 nNonce = 1;
         vRecv >> pfrom->nVersion >> pfrom->nServices >> nTime >> addrMe;
+
+	bool badVersion = false;
         if (pfrom->nVersion < MIN_PEER_PROTO_VERSION)
+        {
+            badVersion = true;
+        }
+        if (pfrom->nVersion < 60201 && (nBestHeight >= nDiffChangeTarget || GetTime() >= nHardforkStartTime))
+        {
+            badVersion = true;
+        }
+        if (pfrom->nVersion >= 70000)
+        {
+            badVersion = true;
+        }
+        if (badVersion)
         {
             // disconnect from peers older than this proto version
             printf("partner %s using obsolete version %i; disconnecting\n", pfrom->addr.ToString().c_str(), pfrom->nVersion);
